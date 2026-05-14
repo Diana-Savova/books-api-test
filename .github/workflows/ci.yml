@@ -1,0 +1,115 @@
+name: Run Books API Tests
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      api_base_url:
+        description: "Base URL of the API under test"
+        required: false
+        default: "https://fakerestapi.azurewebsites.net"
+# Why these permissions:
+#   contents: write       -> peaceiris/actions-gh-pages pushes to gh-pages
+#   checks: write         -> dorny/test-reporter creates check runs
+#   pull-requests: write  -> check-run status shows on PRs
+permissions:
+  contents: write
+  checks: write
+  pull-requests: write
+jobs:
+  test:
+    name: Build image & run test suite
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Sanity check workspace
+        run: |
+          echo "Workspace: ${{ github.workspace }}"
+          pwd && ls -la
+          docker --version
+      - name: Build the test framework image
+        run: |
+          docker build -t api-test-framework:ci .
+          echo "--- Image list after build ---"
+          docker images api-test-framework
+      - name: Run the test suite inside the container
+        continue-on-error: true
+        env:
+          API_BASE_URL: ${{ github.event.inputs.api_base_url || 'https://fakerestapi.azurewebsites.net' }}
+        run: |
+          set +e
+          mkdir -p reports
+          chmod 777 reports
+          echo "--- Starting container ---"
+          docker run --rm \
+            -e API_BASE_URL="${API_BASE_URL}" \
+            -v "${{ github.workspace }}/reports:/app/target" \
+            api-test-framework:ci > docker-run.log 2>&1
+          DOCKER_EXIT=$?
+          echo "--- Container exited with code: ${DOCKER_EXIT} ---"
+          sudo chown -R "$(id -u):$(id -g)" reports/ 2>/dev/null || true
+          echo "--- Final reports/ tree ---"
+          ls -laR reports/ || echo "reports/ missing"
+          echo "--- Tail of docker-run.log ---"
+          tail -100 docker-run.log || echo "docker-run.log missing"
+          exit 0
+      - name: Upload docker-run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-run-log
+          path: docker-run.log
+          if-no-files-found: warn
+      - name: Upload raw Allure results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results
+          path: reports/allure-results
+          if-no-files-found: warn
+      - name: Upload pre-rendered Allure HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report-html
+          path: reports/site/allure-maven-plugin
+          if-no-files-found: warn
+      - name: Upload Surefire (JUnit) XML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: reports/surefire-reports/
+          if-no-files-found: warn
+      - name: Publish Allure HTML to GitHub Pages
+        if: always() && github.ref == 'refs/heads/main' && hashFiles('reports/site/allure-maven-plugin/index.html') != ''
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: reports/site/allure-maven-plugin
+      - name: Show JUnit summary in the run page
+        if: always() && hashFiles('reports/surefire-reports/*.xml') != ''
+        uses: dorny/test-reporter@v1
+        with:
+          name: Spock test results
+          path: reports/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+      - name: Fail job on test failures
+        if: always()
+        run: |
+          if [ ! -d reports/surefire-reports ] || [ -z "$(ls -A reports/surefire-reports/*.xml 2>/dev/null)" ]; then
+            echo "::error::No Surefire XML found - the container never produced test results. Check the docker-run-log artifact."
+            exit 1
+          fi
+          if grep -hE 'failures="[1-9]|errors="[1-9]' reports/surefire-reports/*.xml > /dev/null 2>&1; then
+            echo "::error::One or more tests failed - see Spock test results and the Allure report."
+            exit 1
+          fi
+          echo "All tests passed."
